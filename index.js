@@ -27,34 +27,60 @@ app.use((req, res, next) => {
   next();
 });
 
-// Database Connection Manager
+// Database Connection Manager (never throws; returns null when unavailable)
 let cachedClient = null;
 let cachedDb = null;
+let connectingPromise = null;
+let lastDbError = null;
+let lastFailAt = 0;
+const RETRY_COOLDOWN_MS = 15000; // after a failure, wait before retrying so pages stay fast
 
 async function connectToDatabase() {
   if (cachedDb) return cachedDb;
 
   const uri = process.env.MONGODB_URI;
   if (!uri) {
-    console.warn('MONGODB_URI not set. Operating in memory-fallback mode if DB not available.');
+    lastDbError = 'MONGODB_URI is not set';
     return null;
   }
 
-  try {
-    if (!cachedClient) {
-      cachedClient = new MongoClient(uri, {
-        serverSelectionTimeoutMS: 5000,
+  // Skip retry storms: if we failed very recently, answer instantly
+  if (lastFailAt && Date.now() - lastFailAt < RETRY_COOLDOWN_MS) return null;
+
+  // Share one in-flight connection attempt between concurrent requests
+  if (connectingPromise) return connectingPromise;
+
+  connectingPromise = (async () => {
+    let client = null;
+    try {
+      client = new MongoClient(uri, {
+        serverSelectionTimeoutMS: 4000,
+        connectTimeoutMS: 4000,
         maxPoolSize: 10
       });
-      await cachedClient.connect();
+      await client.connect();
+      const db = client.db();
+      cachedClient = client;
+      cachedDb = db;
+      lastDbError = null;
+      lastFailAt = 0;
+      // Index/seed setup must never block or break requests
+      initDb(db).catch(e => console.error('initDb failed:', e));
+      return db;
+    } catch (err) {
+      console.error('MongoDB Connection Error:', err && err.message);
+      lastDbError = (err && err.message ? err.message : String(err)).split('\n')[0].slice(0, 200);
+      lastFailAt = Date.now();
+      try { if (client) await client.close(); } catch (e) {}
+      cachedClient = null;
+      cachedDb = null;
+      return null;
+    } finally {
+      connectingPromise = null;
     }
-    cachedDb = cachedClient.db();
-    await initDb(cachedDb);
-    return cachedDb;
-  } catch (err) {
-    console.error('MongoDB Connection Error:', err);
-    return null;
-  }
+  })();
+
+  return connectingPromise;
 }
 
 function getDb() {
@@ -122,18 +148,22 @@ async function initDb(db) {
 // Authentication & Session Middleware
 app.use(async (req, res, next) => {
   req.session = null;
-  const db = await connectToDatabase();
-  const token = req.cookies.admin_session || req.cookies.user_session;
+  try {
+    const db = await connectToDatabase();
+    const token = req.cookies.admin_session || req.cookies.user_session;
 
-  if (token && db) {
-    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-    const session = await db.collection('sessions').findOne({
-      tokenHash,
-      expiresAt: { $gt: new Date() }
-    });
-    if (session) {
-      req.session = session;
+    if (token && db) {
+      const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+      const session = await db.collection('sessions').findOne({
+        tokenHash,
+        expiresAt: { $gt: new Date() }
+      });
+      if (session) {
+        req.session = session;
+      }
     }
+  } catch (err) {
+    console.error('Session middleware error:', err);
   }
   next();
 });
@@ -1170,13 +1200,19 @@ app.get('/dashboard', async (req, res) => {
 
 // ------------------- PUBLIC REST API ENDPOINTS -------------------
 
-// Health check endpoint
+// Health check endpoint (safe diagnostics - no secrets exposed)
 app.get('/api/health', async (req, res) => {
   const db = await connectToDatabase();
   res.json({
-    status: 'healthy',
+    status: db ? 'healthy' : 'degraded',
     timestamp: new Date().toISOString(),
     databaseConnected: !!db,
+    databaseError: db ? null : lastDbError,
+    env: {
+      MONGODB_URI: !!process.env.MONGODB_URI,
+      ADMIN_USERNAME: !!process.env.ADMIN_USERNAME,
+      ADMIN_PASSWORD: !!process.env.ADMIN_PASSWORD
+    },
     version: '1.0.0'
   });
 });
@@ -1188,7 +1224,7 @@ app.post('/api/auth/register', async (req, res) => {
 
   try {
     const db = await connectToDatabase();
-    if (!db) return res.status(500).json({ error: 'Database unavailable' });
+    if (!db) return res.status(503).json({ error: 'Service temporarily unavailable. Please try again shortly or call (832) 237-3737.' });
 
     const existing = await db.collection('users').findOne({ email: email.toLowerCase() });
     if (existing) return res.status(400).json({ error: 'Account already exists' });
@@ -1224,7 +1260,7 @@ app.post('/api/auth/login', async (req, res) => {
 
   try {
     const db = await connectToDatabase();
-    if (!db) return res.status(500).json({ error: 'Database unavailable' });
+    if (!db) return res.status(503).json({ error: 'Service temporarily unavailable. Please try again shortly or call (832) 237-3737.' });
 
     const user = await db.collection('users').findOne({ email: email.toLowerCase() });
     if (!user) return res.status(401).json({ error: 'Invalid email or password' });
@@ -1270,7 +1306,7 @@ app.get('/api/auth/me', (req, res) => {
 app.patch('/api/bookings/:id/cancel', async (req, res) => {
   try {
     const db = await connectToDatabase();
-    if (!db) return res.status(500).json({ error: 'Database unavailable' });
+    if (!db) return res.status(503).json({ error: 'Service temporarily unavailable. Please try again shortly or call (832) 237-3737.' });
 
     await db.collection('bookings').updateOne(
       { _id: new ObjectId(req.params.id) },
@@ -1288,7 +1324,7 @@ app.patch('/api/bookings/:id/reschedule', async (req, res) => {
 
   try {
     const db = await connectToDatabase();
-    if (!db) return res.status(500).json({ error: 'Database unavailable' });
+    if (!db) return res.status(503).json({ error: 'Service temporarily unavailable. Please try again shortly or call (832) 237-3737.' });
 
     await db.collection('bookings').updateOne(
       { _id: new ObjectId(req.params.id) },
@@ -1376,7 +1412,7 @@ app.post('/api/bookings', async (req, res) => {
 
   try {
     const db = await connectToDatabase();
-    if (!db) return res.status(500).json({ error: 'Database connection currently unavailable.' });
+    if (!db) return res.status(503).json({ error: 'Booking is temporarily unavailable. Please call (832) 237-3737 to schedule.' });
 
     const slotKey = `${selectedDate}_${selectedTime}_${fullName.replace(/\s+/g, '_')}`;
 
@@ -1466,15 +1502,16 @@ app.post('/api/contact', async (req, res) => {
 
   try {
     const db = await connectToDatabase();
-    if (db) {
-      await db.collection('contactMessages').insertOne({
-        fullName,
-        phone,
-        email: email.toLowerCase(),
-        message,
-        createdAt: new Date()
-      });
+    if (!db) {
+      return res.status(503).json({ error: 'Our messaging system is temporarily unavailable. Please call (832) 237-3737.' });
     }
+    await db.collection('contactMessages').insertOne({
+      fullName,
+      phone,
+      email: String(email).toLowerCase(),
+      message,
+      createdAt: new Date()
+    });
     res.json({ success: true, message: 'Message stored successfully' });
   } catch (err) {
     res.status(500).json({ error: 'Failed to submit contact request' });
@@ -1485,6 +1522,17 @@ app.post('/api/contact', async (req, res) => {
 const adminRouter = createAdminRouter({ getDb, requireAdminAuth });
 app.use('/admin', adminRouter);
 app.use('/api/admin', adminRouter);
+
+// 404 + global error handler (prevents crashes -> FUNCTION_INVOCATION_FAILED)
+app.use((req, res) => res.status(404).send('Not found'));
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  if (res.headersSent) return next(err);
+  if (err && err.type === 'entity.parse.failed') return res.status(400).json({ error: 'Invalid request body' });
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+process.on('unhandledRejection', (err) => console.error('Unhandled rejection:', err));
 
 // Start server locally
 if (require.main === module) {
