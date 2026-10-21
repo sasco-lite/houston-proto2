@@ -1090,13 +1090,13 @@ function createAdminRouter({ getDb, requireAdminAuth }) {
   });
 
   // REST API: Admin Auth
-  router.post('/login', async (req, res) => {
+  router.post('/login', async (req, res, next) => { try {
     const { username, password } = req.body || {};
     const adminUser = process.env.ADMIN_USERNAME;
     const adminPass = process.env.ADMIN_PASSWORD;
 
     if (!adminUser || !adminPass) {
-      return res.status(500).json({ error: 'Server authentication improperly configured.' });
+      return res.status(503).json({ error: 'Admin login is not configured on the server (set ADMIN_USERNAME and ADMIN_PASSWORD).' });
     }
 
     if (username === adminUser && password === adminPass) {
@@ -1105,6 +1105,7 @@ function createAdminRouter({ getDb, requireAdminAuth }) {
       const tokenHash = crypto.createHash('sha256').update(sessionToken).digest('hex');
 
       const db = getDb();
+      if (!db) return res.status(503).json({ error: 'Database unavailable. Check MONGODB_URI and Atlas network access.' });
       await db.collection('sessions').insertOne({
         tokenHash,
         isAdmin: true,
@@ -1127,14 +1128,14 @@ function createAdminRouter({ getDb, requireAdminAuth }) {
     } else {
       return res.status(401).json({ error: 'Invalid admin credentials.' });
     }
-  });
+  } catch (err) { next(err); } });
 
   router.post('/logout', async (req, res) => {
     const token = req.cookies.admin_session;
     if (token) {
       const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
       const db = getDb();
-      await db.collection('sessions').deleteOne({ tokenHash });
+      if (db) await db.collection('sessions').deleteOne({ tokenHash });
     }
     res.clearCookie('admin_session');
     res.json({ success: true, message: 'Logged out' });
@@ -1142,6 +1143,10 @@ function createAdminRouter({ getDb, requireAdminAuth }) {
 
   // Require admin auth middleware for remaining API endpoints
   router.use(requireAdminAuth);
+  router.use((req, res, next) => {
+    if (!getDb()) return res.status(503).json({ error: 'Database temporarily unavailable.' });
+    next();
+  });
 
   // REST API: Admin Overview
   router.get('/overview', async (req, res) => {
