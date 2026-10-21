@@ -1,2 +1,2 @@
 # houston-proto2
-proto type for houston roofing
+proto type for houston roofing & construction
